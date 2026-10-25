@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meso Tracker</title>
+<style>
+  :root { color-scheme: dark; --bg:#111418; --fg:#e8ecf1; --muted:#8b95a3; --accent:#7cfc00; --card:#1b2027; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 16px; }
+  button { background:var(--card); color:var(--fg); border:1px solid #2c3440; padding:8px 14px; border-radius:8px; font:inherit; cursor:pointer; margin:0 6px 6px 0; }
+  button.primary { background:var(--accent); color:#000; border-color:var(--accent); font-weight:600; }
+  button:disabled { opacity:.4; cursor:default; }
+  #stage { position:relative; display:none; max-width:900px; margin:12px 0; }
+  #video { width:100%; display:block; border-radius:8px; background:#000; }
+  #cal { position:absolute; inset:0; width:100%; height:100%; cursor:crosshair; }
+  #hint { color:var(--accent); min-height:22px; }
+  #stats { background:#000; color:var(--accent); font:14px/1.6 ui-monospace,Menlo,Consolas,monospace; padding:10px 14px; border-radius:8px; display:inline-block; min-width:240px; white-space:pre; }
+  small { color:var(--muted); display:block; margin-top:14px; max-width:620px; }
+</style>
+</head>
+<body>
+<h1>Meso Tracker</h1>
+<p class="sub">EXP and meso per hour, read straight from your screen. Nothing is uploaded.</p>
+
+<button class="primary" id="start">1. Pick game window</button>
+<button id="calExp" disabled>2. Set EXP box</button>
+<button id="calMeso" disabled>3. Set meso box</button>
+<button id="run" disabled>Start tracking</button>
+<button id="reset" disabled>Reset</button>
+<button id="pip" disabled>Pop out (always on top)</button>
+<div id="hint"></div>
+
+<div id="stage"><video id="video" muted playsinline></video><canvas id="cal"></canvas></div>
+<div id="stats">Waiting...</div>
+<small>The pop-out button gives an always-on-top mini window in Chrome, Edge and Safari. Keep the game windowed or borderless. Drag a tight box around just the digits. Your boxes are remembered for next time.</small>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), cal = $('cal'), ctx = cal.getContext('2d'), stats = $('stats');
+let regions = {}, calStep = null, drag = null, worker = null, running = false;
+let S = {};
+
+try { regions = JSON.parse(localStorage.getItem('mesoRegions') || '{}'); } catch (e) {}
+
+function resetStats() {
+  S = { start: Date.now(), exp: 0, meso: 0, lastExp: null, lastMeso: null };
+}
+resetStats();
+
+function fmt(n) {
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (a >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (a >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
+function drawBoxes(live) {
+  cal.width = cal.clientWidth; cal.height = cal.clientHeight;
+  ctx.clearRect(0, 0, cal.width, cal.height);
+  ctx.lineWidth = 2; ctx.font = '13px system-ui';
+  for (const [k, r] of Object.entries(regions)) {
+    ctx.strokeStyle = k === 'exp' ? '#ffd400' : '#00d4ff';
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.strokeRect(r.x * cal.width, r.y * cal.height, r.w * cal.width, r.h * cal.height);
+    ctx.fillText(k.toUpperCase(), r.x * cal.width, r.y * cal.height - 4);
+  }
+  if (live) {
+    ctx.strokeStyle = 'red';
+    ctx.strokeRect(live.x, live.y, live.w, live.h);
+  }
+}
+
+function enableIfReady() {
+  const ok = regions.exp && regions.meso && video.srcObject;
+  $('run').disabled = !ok;
+  $('reset').disabled = !ok;
+  $('pip').disabled = !ok;
+}
+
+$('start').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    $('stage').style.display = 'block';
+    $('calExp').disabled = false; $('calMeso').disabled = false;
+    stream.getVideoTracks()[0].onended = () => { running = false; $('hint').textContent = 'Capture stopped.'; };
+    setTimeout(() => { drawBoxes(); enableIfReady(); }, 300);
+  } catch (e) { $('hint').textContent = 'Could not capture: ' + e.message; }
+};
+
+$('calExp').onclick = () => { calStep = 'exp'; $('hint').textContent = 'Drag a box around your EXP number.'; };
+$('calMeso').onclick = () => { calStep = 'meso'; $('hint').textContent = 'Drag a box around your meso number.'; };
+
+cal.onmousedown = e => {
+  if (!calStep) return;
+  const r = cal.getBoundingClientRect();
+  drag = { x: e.clientX - r.left, y: e.clientY - r.top, w: 0, h: 0 };
+};
+cal.onmousemove = e => {
+  if (!drag) return;
+  const r = cal.getBoundingClientRect();
+  drag.w = e.clientX - r.left - drag.x; drag.h = e.clientY - r.top - drag.y;
+  drawBoxes(drag);
+};
+cal.onmouseup = () => {
+  if (!drag) return;
+  const x = Math.min(drag.x, drag.x + drag.w), y = Math.min(drag.y, drag.y + drag.h);
+  const w = Math.abs(drag.w), h = Math.abs(drag.h);
+  drag = null;
+  if (w > 5 && h > 5) {
+    regions[calStep] = { x: x / cal.width, y: y / cal.height, w: w / cal.width, h: h / cal.height };
+    localStorage.setItem('mesoRegions', JSON.stringify(regions));
+    $('hint').textContent = calStep.toUpperCase() + ' box saved.';
+    calStep = null;
+  }
+  drawBoxes(); enableIfReady();
+};
+
+function otsu(hist, total) {
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, max = 0, t = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) ** 2;
+    if (v > max) { max = v; t = i; }
+  }
+  return t;
+}
+
+async function readNumber(r) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const sx = r.x * vw, sy = r.y * vh, sw = r.w * vw, sh = r.h * vh;
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(sw * 3)); c.height = Math.max(1, Math.round(sh * 3));
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(video, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  const img = g.getImageData(0, 0, c.width, c.height), d = img.data;
+  const gray = new Uint8Array(c.width * c.height), hist = new Array(256).fill(0);
+  for (let i = 0; i < gray.length; i++) {
+    const v = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) | 0;
+    gray[i] = v; hist[v]++;
+  }
+  const t = otsu(hist, gray.length);
+  let bright = 0; for (let i = 0; i < gray.length; i++) if (gray[i] > t) bright++;
+  const textIsBright = bright < gray.length / 2;   // text is the minority colour
+  for (let i = 0; i < gray.length; i++) {
+    const b = gray[i] > t;
+    const out = (textIsBright ? !b : b) ? 255 : 0;  // dark text on white
+    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = out; d[i * 4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const { data } = await worker.recognize(c);
+  const digits = (data.text || '').replace(/\D/g, '');
+  return digits ? parseInt(digits, 10) : null;
+}
+
+function render() {
+  const secs = Math.max(1, (Date.now() - S.start) / 1000), hrs = secs / 3600;
+  const h = Math.floor(secs / 3600), m = Math.floor(secs % 3600 / 60), s = Math.floor(secs % 60);
+  const p = n => String(n).padStart(2, '0');
+  stats.textContent =
+    `Time  ${p(h)}:${p(m)}:${p(s)}\n` +
+    `EXP   ${fmt(S.exp)}  (${fmt(S.exp / hrs)}/hr)\n` +
+    `Meso  ${fmt(S.meso)}  (${fmt(S.meso / hrs)}/hr)`;
+  drawPip();
+}
+
+const pipCanvas = document.createElement('canvas');
+pipCanvas.width = 320; pipCanvas.height = 96;
+let pipVideo = null;
+function drawPip() {
+  const g = pipCanvas.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, pipCanvas.width, pipCanvas.height);
+  g.fillStyle = '#7cfc00'; g.font = '16px Menlo, Consolas, monospace';
+  stats.textContent.split('\n').forEach((line, i) => g.fillText(line, 12, 26 + i * 26));
+}
+
+async function loop() {
+  if (!running) return;
+  try {
+    const [exp, meso] = [await readNumber(regions.exp), await readNumber(regions.meso)];
+    if (exp !== null) {
+      if (S.lastExp !== null && exp > S.lastExp) S.exp += exp - S.lastExp;  // ignore drops (level-up / OCR glitch)
+      S.lastExp = exp;
+    }
+    if (meso !== null) {
+      if (S.lastMeso !== null) {
+        const delta = meso - S.lastMeso;
+        if (Math.abs(delta) < Math.max(S.lastMeso, 1e6) * 0.5) S.meso += delta; // ignore wild OCR jumps
+      }
+      S.lastMeso = meso;
+    }
+    render();
+  } catch (e) { stats.textContent = 'Error: ' + e.message; }
+  setTimeout(loop, 1000);
+}
+
+$('run').onclick = async () => {
+  if (running) return;
+  $('hint').textContent = 'Loading OCR...';
+  if (!worker) {
+    worker = await Tesseract.createWorker('eng');
+    await worker.setParameters({ tessedit_char_whitelist: '0123456789,', tessedit_pageseg_mode: '7' });
+  }
+  $('hint').textContent = 'Tracking.';
+  resetStats(); running = true; loop();
+};
+
+$('reset').onclick = () => { resetStats(); render(); };
+
+$('pip').onclick = async () => {
+  if (!('documentPictureInPicture' in window)) {
+    // Safari / Firefox fallback: stream a canvas into a tiny video and use video PiP
+    try {
+      drawPip();
+      if (!pipVideo) {
+        pipVideo = document.createElement('video');
+        pipVideo.muted = true; pipVideo.playsInline = true;
+        pipVideo.srcObject = pipCanvas.captureStream(5);
+      }
+      const playing = pipVideo.play();
+      if (pipVideo.requestPictureInPicture) await pipVideo.requestPictureInPicture();
+      else if (pipVideo.webkitSetPresentationMode) pipVideo.webkitSetPresentationMode('picture-in-picture');
+      else throw new Error('not supported');
+      await playing;
+    } catch (e) {
+      $('hint').textContent = 'Pop-out failed (' + e.message + '). Put this tab beside the game instead.';
+    }
+    return;
+  }
+  const w = await documentPictureInPicture.requestWindow({ width: 280, height: 110 });
+  const st = document.createElement('style');
+  st.textContent = '#stats{background:#000;color:#7cfc00;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;padding:10px 14px;white-space:pre;margin:0}body{margin:0;background:#000}';
+  w.document.head.append(st);
+  w.document.body.append(stats);
+  w.addEventListener('pagehide', () => document.body.insertBefore(stats, document.querySelector('small')));
+};
+</script>
+</body>
+</html>
